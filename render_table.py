@@ -152,28 +152,35 @@ def render_runs(runs, out_path=None):
             if ds not in datasets:
                 datasets.append(ds)
 
-    # acceptance length only when every run has it — mixing it with tok/s in
-    # one column would compare incommensurable units
+    # comparison metric priority: accuracy when every run was scored, else
+    # acceptance length when every run has it, else tok/s — never mix units
+    scored = all(run.get("scored") for run in runs)
     spec = all(run.get("speculative") for run in runs)
-    metric_key = "accept_len" if spec else "tok_s"
+    metric_key = "accuracy" if scored else "accept_len" if spec else "tok_s"
 
     if len(runs) == 1:
         run = runs[0]
         cols = (["Accept. len", "Accept. rate", "Tok/s"] if run.get("speculative")
                 else ["Tok/s", "TTFT (s)", "Tokens"])
+        if run.get("scored"):
+            cols = ["Tok/s", "Accuracy"]
         rows = []
         for ds in datasets:
             m = run["results"][ds]
-            if run.get("speculative"):
+            if run.get("scored"):
+                acc = f"{m['accuracy']*100:.0f}% ({m['graded_n']})" if "accuracy" in m else "—"
+                rows.append((ds, [f"{m['tok_s']:.1f}", acc]))
+            elif run.get("speculative"):
                 al = f"{m['accept_len']:.2f}" if "accept_len" in m else "—"
                 ar = f"{m['accept_rate']*100:.1f}%" if "accept_rate" in m else "—"
                 rows.append((ds, [al, ar, f"{m['tok_s']:.1f}"]))
             else:
                 rows.append((ds, [f"{m['tok_s']:.2f}", f"{m['ttft']:.2f}",
                                   f"{m['tokens']:.0f}"]))
-        rows.append(("Mean", [_mean_cell(run, datasets, k) for k in
-                              (["accept_len", "accept_rate", "tok_s"] if run.get("speculative")
-                               else ["tok_s", "ttft", "tokens"])]))
+        keys = (["tok_s", "accuracy"] if run.get("scored")
+                else ["accept_len", "accept_rate", "tok_s"] if run.get("speculative")
+                else ["tok_s", "ttft", "tokens"])
+        rows.append(("Mean", [_mean_cell(run, datasets, k) for k in keys]))
         title = run["model_label"]
         caption = _caption(run)
         out = out_path or os.path.join(HERE, "results", _slug(title) + ".png")
@@ -185,10 +192,14 @@ def render_runs(runs, out_path=None):
             for r in runs:
                 m = r["results"].get(ds)
                 v = m.get(metric_key) if m else None
-                cells.append(f"{v:.2f}" if v is not None else "—")
+                if v is None:
+                    cells.append("—")
+                else:
+                    cells.append(f"{v*100:.0f}%" if metric_key == "accuracy" else f"{v:.2f}")
             rows.append((ds, cells))
         rows.append(("Mean", [_mean_cell(r, datasets, metric_key) for r in runs]))
-        title = "Mean acceptance length" if spec else "Tokens per second"
+        title = ("Accuracy" if scored else
+                 "Mean acceptance length" if spec else "Tokens per second")
         caption = _caption(runs[0], multi=True)
         out = out_path or os.path.join(HERE, "results", "comparison.png")
 
@@ -201,6 +212,8 @@ def _mean_cell(run, datasets, key):
     if not vals:
         return "—"
     v = sum(vals) / len(vals)
+    if key == "accuracy":
+        return f"{v*100:.0f}%"
     if key == "accept_rate":
         return f"{v*100:.1f}%"
     if key == "tokens":

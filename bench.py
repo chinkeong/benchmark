@@ -30,7 +30,7 @@ import time
 
 import requests
 
-from datasets_io import DATASET_NAMES, load_prompts
+from datasets_io import DATASET_NAMES, load_prompts, load_qa, grade
 import render_table
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -89,12 +89,14 @@ def _suite_hash(prompts_by_ds):
 
 def freeze_suite(path, datasets, samples, seed, max_tokens):
     """Snapshot the exact prompts + settings into a portable suite file."""
-    prompts_by_ds = {ds: load_prompts(ds, samples) for ds in datasets}
+    qa_by_ds = {ds: load_qa(ds, samples) for ds in datasets}
+    prompts_by_ds = {ds: [p for p, _ in qa] for ds, qa in qa_by_ds.items()}
     suite = {
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "settings": {**SAMPLING, "samples": samples, "max_tokens": max_tokens,
                      "seed": seed},
         "prompts": prompts_by_ds,
+        "answers": {ds: [a for _, a in qa] for ds, qa in qa_by_ds.items()},
         "hash": _suite_hash(prompts_by_ds),
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -157,6 +159,10 @@ def run_one(model, prompt, max_tokens, draft_model=None, seed=None,
     body = r.json()
     stats = body.get("stats", {}) or {}
     usage = body.get("usage", {}) or {}
+    try:
+        content = body["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError):
+        content = ""
     completion = usage.get("completion_tokens") or stats.get("predicted_tokens_count") or 0
     accepted = stats.get("accepted_draft_tokens_count")
     total_draft = stats.get("total_draft_tokens_count")
@@ -169,13 +175,16 @@ def run_one(model, prompt, max_tokens, draft_model=None, seed=None,
         rec["accept_len"] = completion / (completion - accepted)
         if total_draft:
             rec["accept_rate"] = accepted / total_draft
+    rec["text"] = content
     return rec
 
 
-def bench_model(model, prompts_by_ds, max_tokens, draft_model, seed, sampling):
+def bench_model(model, prompts_by_ds, max_tokens, draft_model, seed, sampling,
+                answers_by_ds=None):
     results = {}
     speculative = False
     for ds, prompts in prompts_by_ds.items():
+        answers = (answers_by_ds or {}).get(ds) or [None] * len(prompts)
         recs = []
         print(f"[{model}] {ds}: {len(prompts)} prompts")
         for i, p in enumerate(prompts):
@@ -184,10 +193,14 @@ def bench_model(model, prompts_by_ds, max_tokens, draft_model, seed, sampling):
             except (requests.RequestException, RuntimeError) as e:
                 print(f"    prompt {i+1}/{len(prompts)} FAILED: {e}")
                 continue
+            verdict = grade(ds, rec.pop("text"), answers[i])
+            if verdict is not None:
+                rec["correct"] = verdict
             recs.append(rec)
             al = f", accept_len {rec['accept_len']:.2f}" if "accept_len" in rec else ""
+            sc = "" if verdict is None else (", CORRECT" if verdict else ", wrong")
             print(f"    prompt {i+1}/{len(prompts)}: {rec['tokens']} tok, "
-                  f"{rec['tok_s']:.1f} tok/s{al}")
+                  f"{rec['tok_s']:.1f} tok/s{al}{sc}")
         if not recs:
             print(f"    {ds}: all prompts failed, skipping dataset")
             continue
@@ -197,6 +210,10 @@ def bench_model(model, prompts_by_ds, max_tokens, draft_model, seed, sampling):
             "tok_s": _mean(recs, "tok_s"),
             "ttft": _mean(recs, "ttft"),
         }
+        graded = [r for r in recs if "correct" in r]
+        if graded:
+            agg["accuracy"] = sum(r["correct"] for r in graded) / len(graded)
+            agg["graded_n"] = len(graded)
         with_spec = [r for r in recs if "accept_len" in r]
         if with_spec:
             speculative = True
@@ -227,6 +244,10 @@ def main():
     ap.add_argument("--greedy", action="store_true",
                     help="temperature 0 / top-k 1: deterministic decoding for "
                          "quality comparisons (overrides default sampling)")
+    ap.add_argument("--score", action="store_true",
+                    help="grade answers for accuracy on gradeable datasets "
+                         "(GSM8K final number, MATH-500 boxed answer); "
+                         "combine with --greedy for reproducible scores")
     ap.add_argument("--freeze-suite", metavar="FILE",
                     help="write the exact prompts+settings to FILE and exit; "
                          "copy it to other machines for identical runs")
@@ -255,6 +276,7 @@ def main():
     if not args.model:
         ap.error("--model is required (or use --list / --freeze-suite)")
 
+    answers_by_ds = None
     if args.suite:
         suite = load_suite(args.suite)
         prompts_by_ds = suite["prompts"]
@@ -263,9 +285,17 @@ def main():
         args.seed = s.get("seed", args.seed)
         sampling = {k: s[k] for k in SAMPLING}
         suite_hash = suite["hash"]
+        if args.score:
+            answers_by_ds = suite.get("answers")
+            if not answers_by_ds:
+                sys.exit("--score with a suite needs answers in the suite file; "
+                         "re-freeze it with the current bench.py")
         print(f"using suite {args.suite} (hash {suite_hash})")
     else:
-        prompts_by_ds = {ds: load_prompts(ds, args.samples) for ds in datasets}
+        qa_by_ds = {ds: load_qa(ds, args.samples) for ds in datasets}
+        prompts_by_ds = {ds: [p for p, _ in qa] for ds, qa in qa_by_ds.items()}
+        if args.score:
+            answers_by_ds = {ds: [a for _, a in qa] for ds, qa in qa_by_ds.items()}
         sampling = dict(SAMPLING)
         suite_hash = _suite_hash(prompts_by_ds)
 
@@ -289,7 +319,7 @@ def main():
         t0 = time.time()
         results, speculative = bench_model(model, prompts_by_ds,
                                            args.max_tokens, args.draft,
-                                           args.seed, sampling)
+                                           args.seed, sampling, answers_by_ds)
         if not results:
             print(f"no results for {model}, skipping")
             continue
@@ -298,6 +328,7 @@ def main():
             "model_key": model,
             "draft_model": args.draft,
             "speculative": speculative,
+            "scored": bool(args.score),
             "machine": machine,
             "suite_hash": suite_hash,
             "datasets": [d for d in prompts_by_ds if d in results],

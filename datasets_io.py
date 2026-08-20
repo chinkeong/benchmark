@@ -7,6 +7,7 @@ import gzip
 import io
 import json
 import os
+import re
 
 import requests
 
@@ -88,6 +89,16 @@ def build_prompt(name, row):
     raise ValueError(f"unknown dataset {name}")
 
 
+def reference_answer(name, row):
+    """Gradeable ground-truth answer for one row, or None if the dataset
+    has no mechanically-checkable answer (code datasets, MT-Bench)."""
+    if name == "GSM8K":
+        return row["answer"].split("####")[-1].strip()
+    if name == "MATH-500":
+        return str(row.get("answer", "")).strip() or None
+    return None
+
+
 def load_prompts(name, n_samples):
     """Return up to n_samples prompt strings, deterministically spread over the dataset.
 
@@ -96,6 +107,12 @@ def load_prompts(name, n_samples):
     For guaranteed cross-machine fairness, freeze them into a suite file
     (bench.py --freeze-suite) and share that file instead.
     """
+    return [p for p, _ in load_qa(name, n_samples)]
+
+
+def load_qa(name, n_samples):
+    """Like load_prompts but returns (prompt, reference_answer) pairs;
+    the answer is None where the dataset isn't mechanically gradeable."""
     path = _download(name)
     rows = _read_jsonl(path)
     if n_samples >= len(rows):
@@ -103,7 +120,58 @@ def load_prompts(name, n_samples):
     else:
         step = len(rows) / n_samples
         picked = [rows[int(i * step)] for i in range(n_samples)]
-    return [build_prompt(name, r) for r in picked]
+    return [(build_prompt(name, r), reference_answer(name, r)) for r in picked]
+
+
+def _last_boxed(text):
+    """Content of the last \\boxed{...} in text, brace-balanced."""
+    i = text.rfind("\\boxed{")
+    if i < 0:
+        return None
+    j = i + len("\\boxed{")
+    depth = 1
+    out = []
+    while j < len(text) and depth:
+        ch = text[j]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if not depth:
+                break
+        out.append(ch)
+        j += 1
+    return "".join(out) if not depth else None
+
+
+def _norm_answer(s):
+    s = s.strip().replace("$", "").replace(",", "").replace(" ", "")
+    for junk in ("\\left", "\\right", "\\!", "\\,", "\\;"):
+        s = s.replace(junk, "")
+    return s.rstrip(".")
+
+
+def grade(name, response, ref):
+    """True/False: does the model's response match the reference answer?"""
+    if ref is None:
+        return None
+    if name == "GSM8K":
+        if "####" in response:
+            pred = response.rsplit("####", 1)[-1].strip().splitlines()[0]
+        else:
+            nums = re.findall(r"-?\d[\d,]*\.?\d*", response)
+            pred = nums[-1] if nums else ""
+    elif name == "MATH-500":
+        pred = _last_boxed(response) or ""
+    else:
+        return None
+    a, b = _norm_answer(pred), _norm_answer(ref)
+    if a == b:
+        return True
+    try:
+        return abs(float(a) - float(b)) < 1e-6
+    except (TypeError, ValueError):
+        return False
 
 
 if __name__ == "__main__":
