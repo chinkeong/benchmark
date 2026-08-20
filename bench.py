@@ -37,6 +37,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(HERE, "results")
 BASE_URL = "http://localhost:1234"
 
+# progress must be visible live even when stdout is piped/redirected
+# (a multi-hour run with fully buffered output looks hung)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
+
 # Default sampling settings
 SAMPLING = dict(temperature=1.0, top_p=0.95, top_k=20, presence_penalty=1.5)
 

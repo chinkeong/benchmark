@@ -152,7 +152,9 @@ def render_runs(runs, out_path=None):
             if ds not in datasets:
                 datasets.append(ds)
 
-    spec = any(run.get("speculative") for run in runs)
+    # acceptance length only when every run has it — mixing it with tok/s in
+    # one column would compare incommensurable units
+    spec = all(run.get("speculative") for run in runs)
     metric_key = "accept_len" if spec else "tok_s"
 
     if len(runs) == 1:
@@ -163,8 +165,9 @@ def render_runs(runs, out_path=None):
         for ds in datasets:
             m = run["results"][ds]
             if run.get("speculative"):
-                rows.append((ds, [f"{m['accept_len']:.2f}", f"{m['accept_rate']*100:.1f}%",
-                                  f"{m['tok_s']:.1f}"]))
+                al = f"{m['accept_len']:.2f}" if "accept_len" in m else "—"
+                ar = f"{m['accept_rate']*100:.1f}%" if "accept_rate" in m else "—"
+                rows.append((ds, [al, ar, f"{m['tok_s']:.1f}"]))
             else:
                 rows.append((ds, [f"{m['tok_s']:.2f}", f"{m['ttft']:.2f}",
                                   f"{m['tokens']:.0f}"]))
@@ -181,7 +184,8 @@ def render_runs(runs, out_path=None):
             cells = []
             for r in runs:
                 m = r["results"].get(ds)
-                cells.append(f"{m[metric_key]:.2f}" if m else "—")
+                v = m.get(metric_key) if m else None
+                cells.append(f"{v:.2f}" if v is not None else "—")
             rows.append((ds, cells))
         rows.append(("Mean", [_mean_cell(r, datasets, metric_key) for r in runs]))
         title = "Mean acceptance length" if spec else "Tokens per second"
@@ -192,7 +196,10 @@ def render_runs(runs, out_path=None):
 
 
 def _mean_cell(run, datasets, key):
-    vals = [run["results"][ds][key] for ds in datasets if ds in run["results"]]
+    cells = [run["results"][ds] for ds in datasets if ds in run["results"]]
+    vals = [m[key] for m in cells if key in m]
+    if not vals:
+        return "—"
     v = sum(vals) / len(vals)
     if key == "accept_rate":
         return f"{v*100:.1f}%"

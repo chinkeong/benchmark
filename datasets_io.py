@@ -51,8 +51,12 @@ def _download(name):
     data = r.content
     if src.get("gzip"):
         data = gzip.GzipFile(fileobj=io.BytesIO(data)).read()
-    with open(path, "wb") as f:
+    # write-then-rename so an interrupted download can't leave a partial
+    # file that passes the size>0 cache check
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
         f.write(data)
+    os.replace(tmp, path)
     return path
 
 
