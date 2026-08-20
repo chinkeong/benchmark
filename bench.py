@@ -47,6 +47,11 @@ except AttributeError:
 # Default sampling settings
 SAMPLING = dict(temperature=1.0, top_p=0.95, top_k=20, presence_penalty=1.5)
 
+# subprocess text-mode kwargs: on Windows, bare text=True decodes child output
+# as the ANSI codepage (cp1252) and a UTF-8 byte from lms's progress output
+# kills the reader thread mid-communicate(), wedging the run forever
+_TEXT = dict(text=True, encoding="utf-8", errors="replace")
+
 
 def machine_info():
     """Fingerprint of this machine/backend, stored in every result file."""
@@ -58,13 +63,13 @@ def machine_info():
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version",
                             "--format=csv,noheader"], capture_output=True,
-                           text=True, timeout=15)
+                           **_TEXT, timeout=15)
         if r.returncode == 0 and r.stdout.strip():
             info["gpu"] = r.stdout.strip().splitlines()[0]
     except OSError:
         pass
     try:
-        r = subprocess.run(["lms", "version"], capture_output=True, text=True,
+        r = subprocess.run(["lms", "version"], capture_output=True, **_TEXT,
                            timeout=15)
         if r.returncode == 0:
             info["lms"] = r.stdout.strip().splitlines()[0]
@@ -112,7 +117,7 @@ def list_models():
     """Downloaded LLM model keys, via `lms ls --json` with API fallback."""
     try:
         out = subprocess.run(["lms", "ls", "--json"], capture_output=True,
-                             text=True, timeout=30)
+                             **_TEXT, timeout=30)
         if out.returncode == 0:
             models = json.loads(out.stdout)
             return [m["modelKey"] for m in models if m.get("type") not in ("embedding",)
@@ -126,9 +131,9 @@ def list_models():
 
 def load_model(key):
     print(f"loading {key} ...")
-    subprocess.run(["lms", "unload", "--all"], capture_output=True, text=True)
+    subprocess.run(["lms", "unload", "--all"], capture_output=True, **_TEXT)
     r = subprocess.run(["lms", "load", key, "--gpu", "max", "-y"],
-                       capture_output=True, text=True, timeout=600)
+                       capture_output=True, **_TEXT, timeout=600)
     if r.returncode != 0:
         raise RuntimeError(f"lms load failed for {key}:\n{r.stderr or r.stdout}")
 
@@ -312,7 +317,7 @@ def main():
     if not run_files:
         sys.exit("nothing benchmarked")
     if not args.no_load:
-        subprocess.run(["lms", "unload", "--all"], capture_output=True, text=True)
+        subprocess.run(["lms", "unload", "--all"], capture_output=True, **_TEXT)
 
     runs = render_table.load_runs(run_files)
     for rf, run in zip(run_files, runs):
