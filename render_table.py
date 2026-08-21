@@ -240,7 +240,7 @@ def _caption(run, multi=False):
     return (f"{what}. Sampling: temperature {s['temperature']}, top-p {s['top_p']}, "
             f"top-k {s['top_k']}, presence penalty {s['presence_penalty']}{seed}, "
             f"{s['samples']} samples/dataset, max {s['max_tokens']} tokens{draft}{suite}. "
-            f"Measured via LM Studio{where}.")
+            f"Engine: llama.cpp via LM Studio's server{where}.")
 
 
 def _slug(s):

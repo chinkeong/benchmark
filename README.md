@@ -3,9 +3,11 @@
 Benchmarks local models over five standard datasets — GSM8K, MATH-500,
 HumanEval, MBPP, MT-Bench — measuring accuracy (`--score`), per-request mean
 acceptance length (with speculative decoding), or generation throughput, and
-renders the results as a dark table PNG. The datasets, prompt selection,
-scoring, and portable suite files are backend-agnostic; the current runner
-drives models through LM Studio's local server (see requirements).
+renders the results as a dark table PNG. Inference runs on **llama.cpp** —
+LM Studio's local server is only the management layer in front of its bundled
+llama.cpp engine (model library, loading via `lms`, and the stats API the
+runner reads). The datasets, prompt selection, scoring, and portable suite
+files don't depend on it at all.
 
 ## Requirements
 
