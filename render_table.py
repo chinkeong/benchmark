@@ -237,10 +237,14 @@ def _caption(run, multi=False):
     where = mach.get("gpu") or mach.get("cpu") or ""
     where = f" on {mach['host']} ({where})" if mach.get("host") else ""
     suite = f", suite {run['suite_hash']}" if run.get("suite_hash") else ""
+    backend = run.get("backend", {})
+    engine = backend.get("engine", "llama.cpp via LM Studio's server")
+    sa = backend.get("server_args")
+    sa = f" [{sa}]" if sa else ""
     return (f"{what}. Sampling: temperature {s['temperature']}, top-p {s['top_p']}, "
             f"top-k {s['top_k']}, presence penalty {s['presence_penalty']}{seed}, "
             f"{s['samples']} samples/dataset, max {s['max_tokens']} tokens{draft}{suite}. "
-            f"Engine: llama.cpp via LM Studio's server{where}.")
+            f"Engine: {engine}{sa}{where}.")
 
 
 def _slug(s):

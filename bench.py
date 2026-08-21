@@ -1,21 +1,22 @@
-"""Local dataset benchmark for LM Studio models: per-request mean acceptance
-length (speculative decoding) or throughput over GSM8K, MATH-500, HumanEval,
-MBPP and MT-Bench, rendered as a dark table PNG.
+"""Local dataset benchmark for GGUF models on llama.cpp: accuracy (--score),
+per-request mean acceptance length (speculative decoding), or throughput over
+GSM8K, MATH-500, HumanEval, MBPP and MT-Bench, rendered as a dark table PNG.
 
-Mean acceptance length needs speculative decoding: attach a draft model to the
-target model in LM Studio (My Models -> gear icon -> Speculative Decoding), or
-pass --draft <model-key> (forwarded to the API as "draft_model"). With lossless
-rejection sampling every verification pass emits accepted+1 tokens, so:
+The runner launches llama-server itself for each model, waits for /health,
+sends the prompts, and reads llama.cpp's `timings` from every response —
+no external server or management app required.
 
-    mean acceptance length = completion_tokens / (completion_tokens - accepted_draft_tokens)
+Speculative decoding is configured server-side; pass the flags through:
+    --server-args "--spec-type draft-mtp --spec-draft-n-max 10 --spec-draft-p-min 0.5"
+With lossless rejection sampling every verification pass emits accepted+1
+tokens, so:
 
-Without a draft model the run still works and reports tokens/sec instead.
+    mean acceptance length = predicted_n / (predicted_n - draft_n_accepted)
 
 Examples:
-    python bench.py --list
-    python bench.py --model qwen/qwen3.8-27b --samples 10
-    python bench.py --model qwen/qwen3.8-27b --draft qwen/qwen3.8-0.6b
-    python bench.py --model all --samples 5 --datasets GSM8K,MT-Bench
+    python bench.py --model path\\to\\model.gguf --samples 10
+    python bench.py --model a.gguf,b.gguf --datasets GSM8K,MATH-500 --greedy --score
+    python bench.py --model a.gguf --server-args "--spec-type draft-mtp --spec-draft-n-max 10"
 """
 
 import argparse
@@ -24,6 +25,7 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -35,7 +37,6 @@ import render_table
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(HERE, "results")
-BASE_URL = "http://localhost:1234"
 
 # progress must be visible live even when stdout is piped/redirected
 # (a multi-hour run with fully buffered output looks hung)
@@ -48,12 +49,25 @@ except AttributeError:
 SAMPLING = dict(temperature=1.0, top_p=0.95, top_k=20, presence_penalty=1.5)
 
 # subprocess text-mode kwargs: on Windows, bare text=True decodes child output
-# as the ANSI codepage (cp1252) and a UTF-8 byte from lms's progress output
-# kills the reader thread mid-communicate(), wedging the run forever
+# as the ANSI codepage (cp1252) and a UTF-8 byte in a child's output kills the
+# reader thread mid-communicate(), wedging the run forever
 _TEXT = dict(text=True, encoding="utf-8", errors="replace")
 
 
-def machine_info():
+def find_server(explicit=None):
+    """Locate llama-server: --server-bin, $LLAMA_SERVER, PATH, known installs."""
+    candidates = [explicit, os.environ.get("LLAMA_SERVER"),
+                  shutil.which("llama-server"),
+                  r"E:\AI\llama.cpp\llama-server.exe",
+                  r"E:\AI\llama.cpp-dflash\build\bin\llama-server.exe"]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    sys.exit("llama-server not found: pass --server-bin, set LLAMA_SERVER, "
+             "or put llama-server on PATH")
+
+
+def machine_info(server_bin):
     """Fingerprint of this machine/backend, stored in every result file."""
     info = {
         "host": platform.node(),
@@ -69,10 +83,13 @@ def machine_info():
     except OSError:
         pass
     try:
-        r = subprocess.run(["lms", "version"], capture_output=True, **_TEXT,
-                           timeout=15)
-        if r.returncode == 0:
-            info["lms"] = r.stdout.strip().splitlines()[0]
+        r = subprocess.run([server_bin, "--version"], capture_output=True,
+                           **_TEXT, timeout=15)
+        out = (r.stdout or "") + (r.stderr or "")
+        for line in out.splitlines():
+            if line.strip().startswith("version"):
+                info["llama_cpp"] = line.strip()
+                break
     except OSError:
         pass
     return info
@@ -115,35 +132,48 @@ def load_suite(path):
     return suite
 
 
-def list_models():
-    """Downloaded LLM model keys, via `lms ls --json` with API fallback."""
-    try:
-        out = subprocess.run(["lms", "ls", "--json"], capture_output=True,
-                             **_TEXT, timeout=30)
-        if out.returncode == 0:
-            models = json.loads(out.stdout)
-            return [m["modelKey"] for m in models if m.get("type") not in ("embedding",)
-                    and "embed" not in m.get("modelKey", "")]
-    except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired):
-        pass
-    r = requests.get(f"{BASE_URL}/api/v0/models", timeout=10)
-    r.raise_for_status()
-    return [m["id"] for m in r.json()["data"] if m.get("type") != "embeddings"]
+class Server:
+    """One llama-server process hosting one model."""
+
+    def __init__(self, server_bin, model_path, port, ctx, server_args):
+        self.base_url = f"http://127.0.0.1:{port}"
+        cmd = [server_bin, "-m", model_path, "-c", str(ctx), "-ngl", "99",
+               "--parallel", "1", "--jinja",
+               "--host", "127.0.0.1", "--port", str(port)] + server_args
+        print(f"starting llama-server for {os.path.basename(model_path)} ...")
+        self.log = open(os.path.join(RESULTS_DIR, "llama-server.log"), "w",
+                        encoding="utf-8", errors="replace")
+        self.proc = subprocess.Popen(cmd, stdout=self.log, stderr=self.log)
+
+    def wait_ready(self, timeout_s=600):
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            if self.proc.poll() is not None:
+                raise RuntimeError(
+                    f"llama-server exited with code {self.proc.returncode} "
+                    f"(see results/llama-server.log)")
+            try:
+                r = requests.get(f"{self.base_url}/health", timeout=3)
+                if r.ok and r.json().get("status") == "ok":
+                    return
+            except requests.RequestException:
+                pass
+            time.sleep(2)
+        raise RuntimeError("llama-server did not become healthy in time")
+
+    def stop(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.log.close()
 
 
-def load_model(key):
-    print(f"loading {key} ...")
-    subprocess.run(["lms", "unload", "--all"], capture_output=True, **_TEXT)
-    r = subprocess.run(["lms", "load", key, "--gpu", "max", "-y"],
-                       capture_output=True, **_TEXT, timeout=600)
-    if r.returncode != 0:
-        raise RuntimeError(f"lms load failed for {key}:\n{r.stderr or r.stdout}")
-
-
-def run_one(model, prompt, max_tokens, draft_model=None, seed=None,
-            sampling=None, timeout=1800):
+def run_one(base_url, prompt, max_tokens, seed=None, sampling=None,
+            timeout=1800):
     payload = {
-        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "stream": False,
@@ -151,45 +181,45 @@ def run_one(model, prompt, max_tokens, draft_model=None, seed=None,
     }
     if seed is not None:
         payload["seed"] = seed
-    if draft_model:
-        payload["draft_model"] = draft_model
-    r = requests.post(f"{BASE_URL}/api/v0/chat/completions", json=payload,
+    r = requests.post(f"{base_url}/v1/chat/completions", json=payload,
                       timeout=timeout)
     r.raise_for_status()
     body = r.json()
-    stats = body.get("stats", {}) or {}
-    usage = body.get("usage", {}) or {}
+    t = body.get("timings", {}) or {}
     try:
-        content = body["choices"][0]["message"]["content"] or ""
+        msg = body["choices"][0]["message"]
+        # with --jinja llama-server splits thinking into reasoning_content;
+        # the final answer (####, \boxed{}) lives in content
+        content = msg.get("content") or ""
     except (KeyError, IndexError):
         content = ""
-    completion = usage.get("completion_tokens") or stats.get("predicted_tokens_count") or 0
-    accepted = stats.get("accepted_draft_tokens_count")
-    total_draft = stats.get("total_draft_tokens_count")
+    completion = int(t.get("predicted_n") or 0)
     rec = {
         "tokens": completion,
-        "tok_s": stats.get("tokens_per_second", 0.0),
-        "ttft": stats.get("time_to_first_token", 0.0),
+        "tok_s": t.get("predicted_per_second", 0.0) or 0.0,
+        "ttft": (t.get("prompt_ms", 0.0) or 0.0) / 1000.0,
+        "text": content,
     }
+    accepted = t.get("draft_n_accepted")
+    total_draft = t.get("draft_n")
     if accepted is not None and completion and completion > accepted:
         rec["accept_len"] = completion / (completion - accepted)
         if total_draft:
             rec["accept_rate"] = accepted / total_draft
-    rec["text"] = content
     return rec
 
 
-def bench_model(model, prompts_by_ds, max_tokens, draft_model, seed, sampling,
+def bench_model(label, base_url, prompts_by_ds, max_tokens, seed, sampling,
                 answers_by_ds=None):
     results = {}
     speculative = False
     for ds, prompts in prompts_by_ds.items():
         answers = (answers_by_ds or {}).get(ds) or [None] * len(prompts)
         recs = []
-        print(f"[{model}] {ds}: {len(prompts)} prompts")
+        print(f"[{label}] {ds}: {len(prompts)} prompts")
         for i, p in enumerate(prompts):
             try:
-                rec = run_one(model, p, max_tokens, draft_model, seed, sampling)
+                rec = run_one(base_url, p, max_tokens, seed, sampling)
             except (requests.RequestException, RuntimeError) as e:
                 print(f"    prompt {i+1}/{len(prompts)} FAILED: {e}")
                 continue
@@ -241,9 +271,17 @@ def _mean(recs, key):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--list", action="store_true", help="list available models and exit")
-    ap.add_argument("--model", help="model key, comma-separated keys, or 'all'")
-    ap.add_argument("--draft", help="draft model key for speculative decoding")
+    ap.add_argument("--model", help="path to a GGUF file, or comma-separated paths")
+    ap.add_argument("--server-bin", help="path to llama-server (default: "
+                    "$LLAMA_SERVER, PATH, or known local installs)")
+    ap.add_argument("--server-args", default="",
+                    help="extra llama-server flags, e.g. "
+                         "\"--spec-type draft-mtp --spec-draft-n-max 10\" "
+                         "(whitespace-split; avoid paths with spaces)")
+    ap.add_argument("--port", type=int, default=1236,
+                    help="port for the spawned llama-server (default 1236)")
+    ap.add_argument("--ctx", type=int, default=8192,
+                    help="context size -c for the spawned server (default 8192)")
     ap.add_argument("--datasets", default=",".join(DATASET_NAMES),
                     help="comma-separated subset of: " + ", ".join(DATASET_NAMES))
     ap.add_argument("--samples", type=int, default=10, help="prompts per dataset (default 10)")
@@ -263,14 +301,10 @@ def main():
     ap.add_argument("--suite", metavar="FILE",
                     help="run the prompts/settings frozen in FILE instead of "
                          "sampling datasets locally")
-    ap.add_argument("--no-load", action="store_true",
-                    help="don't lms load/unload; rely on JIT loading or an already-loaded model")
+    ap.add_argument("--no-spawn", action="store_true",
+                    help="don't launch llama-server; use whatever is already "
+                         "listening on --port")
     args = ap.parse_args()
-
-    if args.list:
-        for m in list_models():
-            print(m)
-        return
 
     datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
     bad = [d for d in datasets if d not in DATASET_NAMES]
@@ -283,7 +317,15 @@ def main():
         return
 
     if not args.model:
-        ap.error("--model is required (or use --list / --freeze-suite)")
+        ap.error("--model is required (or use --freeze-suite)")
+
+    models = [m.strip() for m in args.model.split(",") if m.strip()]
+    missing = [m for m in models if not os.path.exists(m)]
+    if missing and not args.no_spawn:
+        ap.error(f"model file(s) not found: {missing}")
+
+    server_bin = find_server(args.server_bin)
+    server_args = args.server_args.split()
 
     answers_by_ds = None
     if args.suite:
@@ -311,33 +353,45 @@ def main():
     if args.greedy:
         sampling.update(temperature=0.0, top_k=1, top_p=1.0, presence_penalty=0.0)
 
-    models = list_models() if args.model == "all" else \
-        [m.strip() for m in args.model.split(",") if m.strip()]
-    machine = machine_info()
-    print(f"machine: {machine.get('host')} | {machine.get('gpu', machine.get('cpu'))}")
+    machine = machine_info(server_bin)
+    print(f"machine: {machine.get('host')} | {machine.get('gpu', machine.get('cpu'))} "
+          f"| {machine.get('llama_cpp', 'llama.cpp version unknown')}")
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     run_files = []
     for model in models:
-        if not args.no_load:
-            try:
-                load_model(model)
-            except (RuntimeError, subprocess.TimeoutExpired) as e:
-                print(f"skipping {model}: {e}")
-                continue
+        label = os.path.splitext(os.path.basename(model))[0]
+        server = None
+        base_url = f"http://127.0.0.1:{args.port}"
+        try:
+            if not args.no_spawn:
+                server = Server(server_bin, model, args.port, args.ctx, server_args)
+                server.wait_ready()
+        except RuntimeError as e:
+            print(f"skipping {label}: {e}")
+            if server:
+                server.stop()
+            continue
         t0 = time.time()
-        results, speculative = bench_model(model, prompts_by_ds,
-                                           args.max_tokens, args.draft,
-                                           args.seed, sampling, answers_by_ds)
+        try:
+            results, speculative = bench_model(label, base_url, prompts_by_ds,
+                                               args.max_tokens, args.seed,
+                                               sampling, answers_by_ds)
+        finally:
+            if server:
+                server.stop()
         if not results:
-            print(f"no results for {model}, skipping")
+            print(f"no results for {label}, skipping")
             continue
         run = {
-            "model_label": model.split("/")[-1],
+            "model_label": label,
             "model_key": model,
-            "draft_model": args.draft,
             "speculative": speculative,
             "scored": bool(args.score),
+            "backend": {"engine": "llama.cpp (llama-server)",
+                        "server_bin": server_bin,
+                        "version": machine.get("llama_cpp"),
+                        "server_args": args.server_args},
             "machine": machine,
             "suite_hash": suite_hash,
             "datasets": [d for d in prompts_by_ds if d in results],
@@ -356,8 +410,6 @@ def main():
 
     if not run_files:
         sys.exit("nothing benchmarked")
-    if not args.no_load:
-        subprocess.run(["lms", "unload", "--all"], capture_output=True, **_TEXT)
 
     runs = render_table.load_runs(run_files)
     for rf, run in zip(run_files, runs):

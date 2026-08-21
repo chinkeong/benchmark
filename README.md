@@ -3,29 +3,32 @@
 Benchmarks local models over five standard datasets — GSM8K, MATH-500,
 HumanEval, MBPP, MT-Bench — measuring accuracy (`--score`), per-request mean
 acceptance length (with speculative decoding), or generation throughput, and
-renders the results as a dark table PNG. Inference runs on **llama.cpp** —
-LM Studio's local server is only the management layer in front of its bundled
-llama.cpp engine (model library, loading via `lms`, and the stats API the
-runner reads). The datasets, prompt selection, scoring, and portable suite
-files don't depend on it at all.
+renders the results as a dark table PNG. The runner launches **llama-server**
+(llama.cpp) itself for each model, waits for it to become healthy, and reads
+llama.cpp's `timings` from every response — no external server or management
+app involved.
 
 ## Requirements
 
-- LM Studio with the local server running on `http://localhost:1234`
-  (Developer tab -> Start Server), plus the `lms` CLI on PATH.
+- A llama.cpp build with `llama-server` — found via `--server-bin`, the
+  `LLAMA_SERVER` env var, or PATH.
 - Python 3.10+ with `requests` and `Pillow`.
 
 ## What it measures
 
-**Mean acceptance length** exists only with speculative decoding. Attach a
-draft model to the target model in LM Studio (My Models -> gear ->
-Speculative Decoding -> pick a small draft model), or try `--draft <model-key>`.
-LM Studio's native REST API (`/api/v0/chat/completions`) then reports
-`accepted_draft_tokens_count`; since lossless rejection sampling emits
-`accepted + 1` tokens per verification pass:
+**Mean acceptance length** exists only with speculative decoding, which is
+configured server-side and passed through:
+
+```powershell
+--server-args "--spec-type draft-mtp --spec-draft-n-max 10 --spec-draft-p-min 0.5"
+# external drafter (e.g. DFlash2): --server-args "-md path\to\drafter.gguf --spec-type draft-dflash --spec-draft-n-max 4"
+```
+
+llama-server reports `draft_n` / `draft_n_accepted` in its `timings`; since
+lossless rejection sampling emits `accepted + 1` tokens per verification pass:
 
 ```
-mean acceptance length = completion_tokens / (completion_tokens - accepted_draft_tokens)
+mean acceptance length = predicted_n / (predicted_n - draft_n_accepted)
 ```
 
 This is a *speed* metric, not a quality score — lossless rejection sampling
@@ -50,14 +53,16 @@ Default sampling: temperature 1.0, top-p 0.95, top-k 20, presence penalty 1.5.
 
 ## Usage
 
+`--model` takes GGUF file paths (comma-separated for several -> also a
+comparison PNG). The spawned server defaults: `-ngl 99 --parallel 1 --jinja
+-c 8192` on port 1236; add anything else via `--server-args`.
+
 ```powershell
-python bench.py --list                              # show available model keys
-python bench.py --model qwen/qwen3.8-27b            # full 5-dataset run, 10 samples each
-python bench.py --model qwen/qwen3.8-27b --samples 25 --max-tokens 2048
-python bench.py --model a,b,c                       # several models -> also a comparison PNG
-python bench.py --model all                         # every downloaded LLM (slow!)
-python bench.py --model X --datasets GSM8K,MT-Bench --samples 5   # quick check
-python bench.py --model X --no-load                 # use whatever is already loaded (JIT)
+python bench.py --model C:\models\a.gguf                          # full 5-dataset run
+python bench.py --model a.gguf,b.gguf --samples 25 --max-tokens 2048
+python bench.py --model a.gguf --datasets GSM8K,MT-Bench --samples 5   # quick check
+python bench.py --model a.gguf --server-args "--spec-type draft-mtp --spec-draft-n-max 10"
+python bench.py --model a.gguf --no-spawn --port 1234             # benchmark an already-running server
 ```
 
 Each run writes `results/<model>_<timestamp>.json` and a matching `.png`.
@@ -101,7 +106,7 @@ inherent, not a flaw in the test. Interpretation guide:
 
 ## Files
 
-- `bench.py` — runner: loads each model via `lms`, sends prompts, collects stats
+- `bench.py` — runner: spawns llama-server per model, sends prompts, collects stats
 - `datasets_io.py` — downloads/caches the 5 datasets into `datasets/` and builds prompts
 - `render_table.py` — renders result JSON into a dark table PNG
 - `results/` — run JSONs and PNGs
