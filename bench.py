@@ -210,7 +210,7 @@ def run_one(base_url, prompt, max_tokens, seed=None, sampling=None,
 
 
 def bench_model(label, base_url, prompts_by_ds, max_tokens, seed, sampling,
-                answers_by_ds=None):
+                answers_by_ds=None, checkpoint_cb=None):
     results = {}
     speculative = False
     for ds, prompts in prompts_by_ds.items():
@@ -260,6 +260,10 @@ def bench_model(label, base_url, prompts_by_ds, max_tokens, seed, sampling,
             agg["accept_rate"] = _mean([r for r in with_spec if "accept_rate" in r],
                                        "accept_rate") if any("accept_rate" in r for r in with_spec) else 0.0
         results[ds] = agg
+        # persist after every dataset so an interrupted run loses at most
+        # the dataset in flight, never the finished ones
+        if checkpoint_cb:
+            checkpoint_cb(dict(results), speculative)
     return results, speculative
 
 
@@ -373,38 +377,44 @@ def main():
                 server.stop()
             continue
         t0 = time.time()
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(RESULTS_DIR, f"{render_table._slug(label)}_{stamp}.json")
+
+        def save(results, speculative, model=model, label=label, t0=t0, path=path):
+            run = {
+                "model_label": label,
+                "model_key": model,
+                "speculative": speculative,
+                "scored": bool(args.score),
+                "backend": {"engine": "llama.cpp (llama-server)",
+                            "server_bin": server_bin,
+                            "version": machine.get("llama_cpp"),
+                            "server_args": args.server_args},
+                "machine": machine,
+                "suite_hash": suite_hash,
+                "datasets": [d for d in prompts_by_ds if d in results],
+                "results": results,
+                "settings": {**sampling, "samples": args.samples,
+                             "max_tokens": args.max_tokens, "seed": args.seed},
+                "elapsed_s": round(time.time() - t0, 1),
+                "date": datetime.datetime.now().isoformat(timespec="seconds"),
+            }
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(run, f, indent=2)
+            os.replace(tmp, path)
+
         try:
             results, speculative = bench_model(label, base_url, prompts_by_ds,
                                                args.max_tokens, args.seed,
-                                               sampling, answers_by_ds)
+                                               sampling, answers_by_ds,
+                                               checkpoint_cb=save)
         finally:
             if server:
                 server.stop()
         if not results:
             print(f"no results for {label}, skipping")
             continue
-        run = {
-            "model_label": label,
-            "model_key": model,
-            "speculative": speculative,
-            "scored": bool(args.score),
-            "backend": {"engine": "llama.cpp (llama-server)",
-                        "server_bin": server_bin,
-                        "version": machine.get("llama_cpp"),
-                        "server_args": args.server_args},
-            "machine": machine,
-            "suite_hash": suite_hash,
-            "datasets": [d for d in prompts_by_ds if d in results],
-            "results": results,
-            "settings": {**sampling, "samples": args.samples,
-                         "max_tokens": args.max_tokens, "seed": args.seed},
-            "elapsed_s": round(time.time() - t0, 1),
-            "date": datetime.datetime.now().isoformat(timespec="seconds"),
-        }
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(RESULTS_DIR, f"{render_table._slug(run['model_label'])}_{stamp}.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(run, f, indent=2)
         print(f"saved {path}")
         run_files.append(path)
 
