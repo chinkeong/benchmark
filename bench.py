@@ -193,12 +193,20 @@ def bench_model(model, prompts_by_ds, max_tokens, draft_model, seed, sampling,
             except (requests.RequestException, RuntimeError) as e:
                 print(f"    prompt {i+1}/{len(prompts)} FAILED: {e}")
                 continue
-            verdict = grade(ds, rec.pop("text"), answers[i])
-            if verdict is not None:
-                rec["correct"] = verdict
+            truncated = rec["tokens"] >= max_tokens
+            # a truncated response never reached its final answer: count it
+            # wrong without the last-number fallback, which can luckily match
+            # a mid-thinking number and score a spurious CORRECT
+            text = rec.pop("text")
+            verdict = False if truncated else grade(ds, text, answers[i])
+            if answers[i] is not None:
+                rec["correct"] = bool(verdict)
+                rec["truncated"] = truncated
             recs.append(rec)
             al = f", accept_len {rec['accept_len']:.2f}" if "accept_len" in rec else ""
-            sc = "" if verdict is None else (", CORRECT" if verdict else ", wrong")
+            sc = ("" if answers[i] is None else
+                  ", CORRECT" if verdict else
+                  ", wrong (truncated)" if truncated else ", wrong")
             print(f"    prompt {i+1}/{len(prompts)}: {rec['tokens']} tok, "
                   f"{rec['tok_s']:.1f} tok/s{al}{sc}")
         if not recs:
@@ -214,6 +222,7 @@ def bench_model(model, prompts_by_ds, max_tokens, draft_model, seed, sampling,
         if graded:
             agg["accuracy"] = sum(r["correct"] for r in graded) / len(graded)
             agg["graded_n"] = len(graded)
+            agg["truncated_n"] = sum(r.get("truncated", False) for r in graded)
         with_spec = [r for r in recs if "accept_len" in r]
         if with_spec:
             speculative = True

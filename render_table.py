@@ -168,7 +168,11 @@ def render_runs(runs, out_path=None):
         for ds in datasets:
             m = run["results"][ds]
             if run.get("scored"):
-                acc = f"{m['accuracy']*100:.0f}% ({m['graded_n']})" if "accuracy" in m else "—"
+                if "accuracy" in m:
+                    tr = f", {m['truncated_n']} trunc" if m.get("truncated_n") else ""
+                    acc = f"{m['accuracy']*100:.0f}% ({m['graded_n']}{tr})"
+                else:
+                    acc = "—"
                 rows.append((ds, [f"{m['tok_s']:.1f}", acc]))
             elif run.get("speculative"):
                 al = f"{m['accept_len']:.2f}" if "accept_len" in m else "—"
