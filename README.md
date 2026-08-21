@@ -1,9 +1,11 @@
-# Local LM Studio dataset benchmark
+# Local dataset benchmark
 
-Benchmarks any model in your local LM Studio library over five standard
-datasets — GSM8K, MATH-500, HumanEval, MBPP, MT-Bench — measuring per-request
-mean acceptance length (with speculative decoding) or generation throughput,
-and renders the results as a dark table PNG.
+Benchmarks local models over five standard datasets — GSM8K, MATH-500,
+HumanEval, MBPP, MT-Bench — measuring accuracy (`--score`), per-request mean
+acceptance length (with speculative decoding), or generation throughput, and
+renders the results as a dark table PNG. The datasets, prompt selection,
+scoring, and portable suite files are backend-agnostic; the current runner
+drives models through LM Studio's local server (see requirements).
 
 ## Requirements
 
@@ -30,6 +32,17 @@ number only means more tokens per verification pass.
 
 Without a draft model the run still works and the table shows **tokens/sec,
 TTFT, and mean output tokens** instead.
+
+**Accuracy** (`--score`) grades answers on the mechanically-checkable
+datasets: GSM8K (final number after `####`, numeric-tolerant) and MATH-500
+(last `\boxed{}` answer, LaTeX-normalized). Responses that hit `--max-tokens`
+are counted wrong and reported separately as truncations — raise the cap for
+thinking models (4096+) or the score measures your budget, not the model.
+Combine with `--greedy` for reproducible per-machine scores:
+
+```powershell
+python bench.py --model a,b --datasets GSM8K,MATH-500 --samples 20 --max-tokens 4096 --greedy --score
+```
 
 Default sampling: temperature 1.0, top-p 0.95, top-k 20, presence penalty 1.5.
 
